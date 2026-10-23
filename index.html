@@ -16,7 +16,7 @@
    - Paramétrage (sections, items, types de toiture) : data.json
    - Enregistrement des fiches : localStorage du navigateur
      (chaque appareil garde ses propres fiches)
-   - Sauvegarde / transfert : export et import JSON
+   - Sortie : export PDF (fiche ou récapitulatif)
    ============================================================ */
 
 var STORAGE_KEY = "attila-fiches-chantier-v1";
@@ -179,6 +179,15 @@ var HEAD_EXTRA =
   'table.recap tbody tr:hover{background:var(--surface-2);}' +
   'table.recap tbody tr{cursor:pointer;}' +
 
+  'body.pdf-mode .tabs,body.pdf-mode .btnrow,body.pdf-mode .pagehead .btn,body.pdf-mode .banner,body.pdf-mode .footnote{display:none !important;}' +
+  'body.pdf-mode .topbar{position:static;}' +
+  'body.pdf-mode .tablewrap{overflow:visible;}body.pdf-mode table.recap{min-width:0;}' +
+  'body.pdf-mode .shell,body.pdf-mode .topbar-inner{max-width:none;}' +
+  'body.pdf-mode .shell{padding-bottom:1.5rem;}' +
+  '.pdf-busy{position:fixed;inset:0;background:rgba(35,46,45,.35);display:flex;align-items:center;justify-content:center;z-index:50;}' +
+  '.pdf-busy div{background:var(--surface);color:var(--text);padding:1rem 1.4rem;border-radius:.6rem;font-weight:600;box-shadow:var(--shadow);}' +
+  '@media print{.tabs,.btnrow,.pagehead .btn,.banner,.footnote{display:none !important;}.topbar{position:static;}' +
+    '.tablewrap{overflow:visible;}.card,.ccard,tr{break-inside:avoid;}body{background:#fff;}}' +
   '.footnote{margin-top:2.5rem;padding-top:1.25rem;border-top:1px solid var(--border);color:var(--text-muted);font-size:.78rem;line-height:1.6;}' +
   '</style>';
 
@@ -283,65 +292,106 @@ function findChantier(id) {
   return null;
 }
 
-/* ---------- Export CSV ---------- */
-function csvEscape(v) {
-  var s = v == null ? "" : String(v);
-  if (/[;"\n\r]/.test(s)) s = '"' + s.replace(/"/g, '""') + '"';
-  return s;
-}
-function csvRows(rows) {
-  return "﻿" + rows.map(function (r) { return r.map(csvEscape).join(";"); }).join("\r\n");
-}
-function buildFicheCSV(rec) {
-  var rows = [["Champ", "Valeur"]];
-  rows.push(["Nom du client", rec.client]);
-  rows.push(["Adresse", rec.adresse]);
-  rows.push(["Date de la visite", fmtDate(rec.dateVisite)]);
-  rows.push(["TTA référent", rec.ttaReferent]);
-  rows.push(["Autres TTA présents", rec.autresTta]);
-  rows.push(["Type de toiture", rec.typeToiture]);
-  rows.push(["Statut sécurité", statusMeta(computeSectionStatus(rec.securite, "securite")).label]);
-  rows.push(["Statut organisation", statusMeta(computeSectionStatus(rec.organisation, "organisation")).label]);
-  ["securite", "organisation"].forEach(function (secKey) {
-    SECTION_DEFS[secKey].items.forEach(function (it) {
-      var cell = rec[secKey][it.key] || { etat: null, commentaire: "" };
-      rows.push([SECTION_DEFS[secKey].title + " — " + it.label + " (état)", cell.etat ? statusMeta(cell.etat).label : "Non évalué"]);
-      rows.push([SECTION_DEFS[secKey].title + " — " + it.label + " (commentaire)", cell.commentaire || ""]);
-    });
-  });
-  rows.push(["Créée le", rec.createdAt]);
-  rows.push(["Dernière mise à jour", rec.updatedAt]);
-  return csvRows(rows);
-}
-function buildRecapCSV(list) {
-  var rows = [["Client", "Adresse", "Date de visite", "TTA référent", "Autres TTA présents",
-    "Type de toiture", "Statut sécurité", "Statut organisation", "Dernière mise à jour"]];
-  list.forEach(function (rec) {
-    rows.push([rec.client, rec.adresse, fmtDate(rec.dateVisite), rec.ttaReferent, rec.autresTta,
-      rec.typeToiture,
-      statusMeta(computeSectionStatus(rec.securite, "securite")).label,
-      statusMeta(computeSectionStatus(rec.organisation, "organisation")).label,
-      fmtDate((rec.updatedAt || "").slice(0, 10))]);
-  });
-  return csvRows(rows);
-}
+/* ---------- Export PDF (copie fidèle de l'écran) ---------- */
 function safeFilename(s) {
-  return String(s || "chantier").normalize("NFKD").replace(/[̀-ͯ]/g, "")
+  return String(s || "chantier").normalize("NFKD").replace(/[\u0300-\u036f]/g, "")
     .replace(/[^a-zA-Z0-9-_ ]/g, "").trim().replace(/\s+/g, "-").slice(0, 60) || "chantier";
 }
-function downloadFile(filename, content, mime) {
-  try {
-    var blob = new Blob([content], { type: mime });
-    var url = URL.createObjectURL(blob);
-    var a = document.createElement("a");
-    a.href = url; a.download = filename;
-    document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
-  } catch (e) {
-    alertBanner("Le téléchargement a échoué sur cet appareil.");
-  }
+var PDF_LIBS = [
+  "https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js",
+  "https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"
+];
+var pdfLibsPromise = null;
+function loadScript(src) {
+  return new Promise(function (resolve, reject) {
+    var el = document.createElement("script");
+    el.src = src; el.onload = resolve; el.onerror = reject;
+    document.head.appendChild(el);
+  });
 }
-function exportCSV(filename, content) { downloadFile(filename, content, "text/csv;charset=utf-8"); }
+function loadPdfLibs() {
+  if (window.html2canvas && window.jspdf) return Promise.resolve();
+  if (!pdfLibsPromise) {
+    pdfLibsPromise = Promise.all(PDF_LIBS.map(loadScript)).catch(function (e) { pdfLibsPromise = null; throw e; });
+  }
+  return pdfLibsPromise;
+}
+/* Cherche, en remontant depuis "limit", une ligne de pixels sans texte
+   pour éviter de couper une ligne ou un item entre deux pages. */
+function findBreak(ctx, width, start, limit) {
+  var minY = start + Math.floor((limit - start) * 0.7);
+  var data = ctx.getImageData(0, minY, width, limit - minY).data;
+  for (var y = limit - minY - 1; y >= 0; y--) {
+    var row = y * width * 4, mid = row + Math.floor(width / 2) * 4;
+    var r0 = data[mid], g0 = data[mid + 1], b0 = data[mid + 2], diff = 0;
+    for (var x = 0; x < width; x += 2) {
+      var i = row + x * 4;
+      if (Math.abs(data[i] - r0) + Math.abs(data[i + 1] - g0) + Math.abs(data[i + 2] - b0) > 60) diff++;
+    }
+    if (diff < width * 0.01) return minY + y;
+  }
+  return limit;
+}
+function exportPDF(filename, landscape) {
+  var root = document.documentElement;
+  var prevTheme = root.getAttribute("data-theme");
+  var busy = document.createElement("div");
+  busy.className = "pdf-busy"; busy.innerHTML = "<div>Préparation du PDF…</div>";
+  document.body.appendChild(busy);
+  function cleanup() {
+    document.body.classList.remove("pdf-mode");
+    if (prevTheme == null) root.removeAttribute("data-theme"); else root.setAttribute("data-theme", prevTheme);
+    busy.remove();
+  }
+  loadPdfLibs().then(function () {
+    root.setAttribute("data-theme", "light");          // PDF toujours en thème clair
+    document.body.classList.add("pdf-mode");
+    var target = document.getElementById("app");
+    var width = landscape ? 1240 : 900;                 // largeur de mise en page simulée
+    return (document.fonts && document.fonts.ready ? document.fonts.ready : Promise.resolve()).then(function () {
+      return window.html2canvas(target, {
+        scale: 2, useCORS: true, backgroundColor: "#F6F5F2",
+        windowWidth: width, width: width, scrollX: 0, scrollY: 0,
+        onclone: function (doc) { doc.getElementById("app").style.width = width + "px"; }
+      });
+    });
+  }).then(function (canvas) {
+    var jsPDF = window.jspdf.jsPDF;
+    var pdf = new jsPDF({ orientation: landscape ? "landscape" : "portrait", unit: "mm", format: "a4" });
+    var pageW = pdf.internal.pageSize.getWidth(), pageH = pdf.internal.pageSize.getHeight();
+    var margin = 8, footer = 6;
+    var imgW = pageW - margin * 2;
+    var pxPerMm = canvas.width / imgW;
+    var pagePx = Math.floor((pageH - margin * 2 - footer) * pxPerMm);
+    var ctx = canvas.getContext("2d");
+    var slices = [], y = 0;
+    while (y < canvas.height) {
+      var end = Math.min(y + pagePx, canvas.height);
+      if (end < canvas.height) end = findBreak(ctx, canvas.width, y, end);
+      slices.push([y, end]); y = end;
+    }
+    slices.forEach(function (sl, i) {
+      if (i > 0) pdf.addPage();
+      var h = sl[1] - sl[0];
+      var part = document.createElement("canvas");
+      part.width = canvas.width; part.height = h;
+      var pctx = part.getContext("2d");
+      pctx.fillStyle = "#F6F5F2"; pctx.fillRect(0, 0, part.width, h);
+      pctx.drawImage(canvas, 0, sl[0], canvas.width, h, 0, 0, canvas.width, h);
+      pdf.setFillColor(246, 245, 242); pdf.rect(0, 0, pageW, pageH, "F");
+      pdf.addImage(part.toDataURL("image/jpeg", 0.92), "JPEG", margin, margin, imgW, h / pxPerMm);
+      pdf.setFontSize(8); pdf.setTextColor(92, 105, 104);
+      pdf.text("ATTILA · Fiche de visite chantier · édité le " + fmtDate(todayISO()), margin, pageH - margin + 2);
+      pdf.text("Page " + (i + 1) + " / " + slices.length, pageW - margin, pageH - margin + 2, { align: "right" });
+    });
+    cleanup();
+    pdf.save(filename);
+  }).catch(function () {
+    cleanup();
+    /* Pas de réseau pour charger les bibliothèques : impression navigateur (« Enregistrer en PDF ») */
+    window.print();
+  });
+}
 
 /* ---------- Persistance (localStorage) ---------- */
 function alertBanner(msg) { lastError = msg; render(); }
@@ -359,7 +409,7 @@ function saveLocal() {
 }
 function persist(mutateFn) {
   mutateFn(STATE);
-  if (!saveLocal()) alertBanner("Enregistrement impossible sur cet appareil (navigation privée ou stockage bloqué). Exportez la fiche avant de fermer la page.");
+  if (!saveLocal()) alertBanner("Enregistrement impossible sur cet appareil (navigation privée ou stockage bloqué). Exportez la fiche en PDF avant de fermer la page.");
 }
 function normalizeRecord(rec) {
   ["securite", "organisation"].forEach(function (secKey) {
@@ -371,37 +421,6 @@ function normalizeRecord(rec) {
   if (!rec.id) rec.id = uid();
   return rec;
 }
-function exportJSON() {
-  var payload = JSON.stringify({ chantiers: STATE.chantiers }, null, 2);
-  downloadFile("fiches-chantier-" + todayISO() + ".json", payload, "application/json");
-}
-function importJSON(file) {
-  var reader = new FileReader();
-  reader.onload = function () {
-    try {
-      var parsed = JSON.parse(reader.result);
-      var list = Array.isArray(parsed) ? parsed : parsed && parsed.chantiers;
-      if (!Array.isArray(list)) throw new Error("format");
-      var added = 0, updated = 0;
-      persist(function (state) {
-        list.forEach(function (rec) {
-          rec = normalizeRecord(rec);
-          var idx = -1;
-          for (var i = 0; i < state.chantiers.length; i++) if (state.chantiers[i].id === rec.id) idx = i;
-          if (idx >= 0) {
-            if ((rec.updatedAt || "") >= (state.chantiers[idx].updatedAt || "")) { state.chantiers[idx] = rec; updated++; }
-          } else { state.chantiers.push(rec); added++; }
-        });
-      });
-      view = "liste";
-      alertBanner("Import terminé : " + added + " fiche(s) ajoutée(s), " + updated + " mise(s) à jour.");
-    } catch (e) {
-      alertBanner("Fichier non reconnu : il faut un export JSON de cette fiche de visite.");
-    }
-  };
-  reader.readAsText(file);
-}
-
 /* ---------- Rendu ---------- */
 function tabsHtml() {
   function tab(v, label) {
@@ -412,14 +431,14 @@ function tabsHtml() {
 function shellHtml(inner) {
   var banner = "";
   if (lastError) banner = '<div class="banner"><div class="banner-box">' + escapeHtml(lastError) + "</div></div>";
-  else if (!storageOk) banner = '<div class="banner"><div class="banner-box">Stockage indisponible sur ce navigateur : les saisies seront perdues à la fermeture. Exportez en JSON avant de quitter.</div></div>';
+  else if (!storageOk) banner = '<div class="banner"><div class="banner-box">Stockage indisponible sur ce navigateur : les saisies seront perdues à la fermeture. Exportez vos fiches en PDF avant de quitter.</div></div>';
   return '<div class="topbar"><div class="topbar-inner">' +
     '<div class="brand"><div class="brand-mark"><div class="roof"></div><div class="base"></div></div>' +
     '<div class="brand-word"><b>ATTILA</b><span>répare et entretient vos toits</span></div></div>' +
     '<div class="apptitle">Fiche de visite chantier</div>' + tabsHtml() +
     "</div></div>" + banner +
     '<div class="shell">' + inner +
-    '<div class="footnote">Outil interne ATTILA — usage réseau. Les statuts Sécurité et Organisation sont calculés automatiquement à partir des items évalués (le plus défavorable des quatre items détermine le statut de la section) ; une fiche dont un item n’est pas encore évalué affiche « à compléter ». Cette fiche ne remplace pas le document unique d’évaluation des risques ni les obligations réglementaires de l’agence : en cas d’écart constaté, appliquez la procédure sécurité en vigueur.<br>Les fiches sont enregistrées dans le navigateur de cet appareil uniquement. Utilisez l’export JSON pour les sauvegarder ou les transmettre.</div>' +
+    '<div class="footnote">Outil interne ATTILA — usage réseau. Les statuts Sécurité et Organisation sont calculés automatiquement à partir des items évalués (le plus défavorable des quatre items détermine le statut de la section) ; une fiche dont un item n’est pas encore évalué affiche « à compléter ». Cette fiche ne remplace pas le document unique d’évaluation des risques ni les obligations réglementaires de l’agence : en cas d’écart constaté, appliquez la procédure sécurité en vigueur.<br>Les fiches sont enregistrées dans le navigateur de cet appareil uniquement. Utilisez l’export PDF pour les transmettre ou les archiver.</div>' +
     "</div>";
 }
 
@@ -444,9 +463,7 @@ function renderListe() {
   }
   return shellHtml('<div class="pagehead"><div><h1>Chantiers visités</h1>' +
     '<p>' + list.length + " fiche" + (list.length > 1 ? "s" : "") + " enregistrée" + (list.length > 1 ? "s" : "") + "</p></div>" +
-    '<div class="btnrow"><button type="button" class="btn" data-export-json="1">Exporter (JSON)</button>' +
-    '<label class="btn" style="cursor:pointer;">Importer (JSON)<input type="file" accept="application/json,.json" data-import-json="1" hidden></label>' +
-    '<button type="button" class="btn btn-primary" data-nav="form-new">+ Nouvelle fiche</button></div></div>' + body);
+    '<button type="button" class="btn btn-primary" data-nav="form-new">+ Nouvelle fiche</button></div>' + body);
 }
 
 function evalSectionHtml(defKey, sectionState) {
@@ -522,7 +539,7 @@ function renderDetail() {
   }
   var html = '<div class="pagehead"><div><h1>' + escapeHtml(rec.client || "(client non renseigné)") + "</h1>" +
     "<p>Visite du " + fmtDate(rec.dateVisite) + "</p></div>" +
-    '<div class="btnrow"><button type="button" class="btn" data-export-fiche="' + rec.id + '">Exporter en CSV</button>' +
+    '<div class="btnrow"><button type="button" class="btn" data-pdf-fiche="' + rec.id + '">Exporter en PDF</button>' +
     '<button type="button" class="btn btn-primary" data-edit="' + rec.id + '">Modifier</button></div></div>' +
     '<div class="card"><h2>Chantier</h2><dl class="detailgrid">' +
     dfield("Client", rec.client) + dfield("Adresse", rec.adresse) + dfield("Date de la visite", fmtDate(rec.dateVisite)) +
@@ -552,7 +569,8 @@ function renderRecap() {
       "<th>Statut organisation</th><th>Maj</th></tr></thead><tbody>" + rows + "</tbody></table></div>"
     : '<div class="empty">Aucun chantier à récapituler.</div>';
   return shellHtml('<div class="pagehead"><div><h1>Récapitulatif des chantiers</h1><p>Vue d’ensemble en annexe, tous chantiers confondus</p></div>' +
-    '<button type="button" class="btn" data-export-recap="1">Exporter le récapitulatif en CSV</button></div>' + table);
+    '<div class="btnrow"><button type="button" class="btn" data-pdf-recap="1"' + (list.length ? "" : " disabled") + '>Exporter en PDF</button>' +
+    '</div></div>' + table);
 }
 
 function render() {
@@ -617,15 +635,13 @@ document.addEventListener("click", function (e) {
     return;
   }
 
-  var expFiche = e.target.closest("[data-export-fiche]");
-  if (expFiche) {
-    var recF = findChantier(expFiche.getAttribute("data-export-fiche"));
-    if (recF) exportCSV(safeFilename(recF.client) + "-" + recF.dateVisite + ".csv", buildFicheCSV(recF));
+  var pdfFiche = e.target.closest("[data-pdf-fiche]");
+  if (pdfFiche) {
+    var recP = findChantier(pdfFiche.getAttribute("data-pdf-fiche"));
+    if (recP) exportPDF("fiche-visite-" + safeFilename(recP.client) + "-" + recP.dateVisite + ".pdf", false);
     return;
   }
-  var expRecap = e.target.closest("[data-export-recap]");
-  if (expRecap) { exportCSV("recapitulatif-chantiers-attila.csv", buildRecapCSV(sortedChantiers())); return; }
-  if (e.target.closest("[data-export-json]")) { exportJSON(); return; }
+  if (e.target.closest("[data-pdf-recap]")) { exportPDF("recapitulatif-chantiers-" + todayISO() + ".pdf", true); return; }
 }, false);
 
 document.addEventListener("input", function (e) {
@@ -634,11 +650,6 @@ document.addEventListener("input", function (e) {
     var parts = t.getAttribute("data-comment").split("|");
     draft[parts[0]][parts[1]].commentaire = t.value;
   }
-}, false);
-
-document.addEventListener("change", function (e) {
-  var t = e.target;
-  if (t.matches("[data-import-json]") && t.files && t.files[0]) { importJSON(t.files[0]); t.value = ""; }
 }, false);
 
 document.addEventListener("submit", function (e) {
